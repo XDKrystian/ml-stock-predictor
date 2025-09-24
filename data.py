@@ -3,17 +3,17 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from networkx.algorithms.threshold import creation_sequence
 
-from  data_colecting import download_parts_data
+from  data_colecting import download_parts_data_with_buffer
 from datetime import datetime, timedelta
 import numpy as np
 from torch.distributions.constraints import interval
 from yfinance.utils import auto_adjust
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
 from sklearn.model_selection import train_test_split
 import joblib
 
 # Dodaj wskaźniki
-data_clear  = download_parts_data(
+data_clear  = download_parts_data_with_buffer(
     ticker="AAPL",
     start_date=datetime(2022, 1, 1),
     end_date=datetime(2025, 1, 2)
@@ -93,61 +93,115 @@ high_52 = data_with_indicators['High'].rolling(window=52).max()
 low_52 = data_with_indicators['Low'].rolling(window=52).min()
 data_with_indicators['SenkouB'] = ((high_52 + low_52) / 2).shift(26)
 
-def create_sequences(data, sequence_length):
-    """Tworzy sekwencje danych dla modeli czasowych"""
+data_with_indicators.columns = [f"{c[0]}_{c[1]}" if c[1] else c[0] for c in data_with_indicators.columns]
+
+
+
+data_with_indicators = data_with_indicators.iloc[200:]
+
+data_with_indicators.to_excel('data_before.xlsx')
+
+print(data_with_indicators.columns)
+
+
+
+print(type(data_with_indicators))
+
+
+def create_sequences(data, target_idx, time_steps=60):
+    """
+    data: numpy array (wszystkie dane z feature + target)
+    target_idx: index kolumny targetu w tym array
+    """
     X, y = [], []
-    for i in range(len(data) - sequence_length):
-        X.append(data[i:(i + sequence_length)])
-        y.append(data[i + sequence_length])
+    for i in range(time_steps, len(data)):
+        X.append(data[i - time_steps:i])
+        y.append(data[i, target_idx])
     return np.array(X), np.array(y)
 
 
+def prepare_train_val_test_data(
+        df,
+        feature_columns=None,
+        target_column="Close_AAPL",
+        target_shift_days=[3, 7],
+        sequence_length=30,
+        train_ratio=0.7,
+        val_ratio=0.1,
+        scaler_type="standard",
+        use_price_change=True
+):
+    df = df.copy()
 
-def prepare_data_for_ai_model(data_frame_with_indicators, sequence_length=30):
-    # Kopia danych aby nie modyfikować oryginału
+    # 1️ tworzymy targety przesunięte
+    target_cols = []
+    for shift in target_shift_days:
+        col_name = f"Target_{shift}d"
+        if use_price_change:
+            df.loc[:, col_name] = (df[target_column].shift(-shift) - df[target_column]) / df[target_column] * 100
+        else:
+            df[col_name] = df[target_column].shift(-shift)
+        target_cols.append(col_name)
 
-    if isinstance(data_frame_with_indicators.columns, pd.MultiIndex):
-        data_frame_with_indicators.columns = [
-            f'{col[0]}_{col[1]}' if col[1] else col[0]
-            for col in data_frame_with_indicators.columns
-        ]
+    max_shift = max(target_shift_days)
+    if max_shift > 0:
+        df = df.iloc[:-max_shift].reset_index(drop=True)
 
-        # Sprawdź nowe nazwy kolumn
-    #print("Spłaszczone kolumny:", data_frame_with_indicators.columns.tolist())
+    if feature_columns is None:
+        feature_columns = [col for col in df.columns if col not in ["Date", target_column] + target_cols]
 
-    df = data_frame_with_indicators.copy()
+    # 2️ podział na zbiory (kolejne segmenty, bez "ze środka")
+    n_total = len(df)
+    n_train = int(n_total * train_ratio)
+    n_val = int(n_total * val_ratio)
 
-    # 1. Usuwanie brakujących wartości
-    df = df.dropna()
+    df_train = df.iloc[:n_train]
+    df_val = df.iloc[n_train:n_train + n_val]
+    df_test = df.iloc[n_train + n_val:]
 
-    # 2. Tworzenie targetu
-    df['Target'] = df['Close_AAPL'].shift(-1)
-    df = df[:-1]  # usuwamy ostatni wiersz z NaN w targetcie
+    # 3️ skalowanie (fit tylko na train, potem transform na resztę)
+    if scaler_type == "standard":
+        scaler = StandardScaler()
+    elif scaler_type == "minmax":
+        scaler = MinMaxScaler()
+    elif scaler_type == "robust":
+        scaler = RobustScaler()
+    else:
+        raise ValueError("scaler_type must be 'standard', 'minmax' or 'robust'")
 
-    # 3. Definiowanie kolumn features
-    feature_columns = [col for col in df.columns
-                       if col not in ['Date', 'Target', 'Close_AAPL', 'Price_Change']]
+    df_train_scaled = df_train.copy()
+    df_val_scaled = df_val.copy()
+    df_test_scaled = df_test.copy()
 
-    # 4. Normalizacja TYLKO cech (nie całego DataFrame!)
-    scaler = StandardScaler()
-    df_scaled = df.copy()  # tworzymy kopię
-    df_scaled[feature_columns] = scaler.fit_transform(df[feature_columns])
+    scaler.fit(df_train[feature_columns])
+    df_train_scaled[feature_columns] = scaler.transform(df_train[feature_columns])
+    df_val_scaled[feature_columns] = scaler.transform(df_val[feature_columns])
+    df_test_scaled[feature_columns] = scaler.transform(df_test[feature_columns])
 
-    # 5. Tworzenie sekwencji (funkcja musi być zdefiniowana!)
-    X, y_sequences = create_sequences(df_scaled[feature_columns].values, sequence_length)
+    # 4️ sekwencje – multi-target
+    target_indices = [df.columns.get_loc(c) for c in target_cols]
 
-    # 6. Dopasowanie targetu do sekwencji
-    y_target = df['Target'].values[sequence_length:]
+    def create_multi_sequences(data, time_steps=60):
+        X, y = [], []
+        for i in range(time_steps, len(data)):
+            X.append(data[i - time_steps:i])
+            y.append(data[i, target_indices])  # wszystkie targety
+        return np.array(X), np.array(y)
 
-    return X, y_sequences, y_target, scaler, feature_columns
+    X_train, y_train = create_multi_sequences(df_train_scaled.values, sequence_length)
+    X_val, y_val = create_multi_sequences(df_val_scaled.values, sequence_length)
+    X_test, y_test = create_multi_sequences(df_test_scaled.values, sequence_length)
+
+    return X_train, y_train, X_val, y_val, X_test, y_test, scaler, feature_columns, target_cols
 
 
-X, y_sequences, y_target, scaler, features = prepare_data_for_ai_model(data_with_indicators)
-
-# print(f"X shape: {X.shape}")          # (próbki, sequence_length, cechy)
-# print(f"y_sequences shape: {y_sequences.shape}")  # (próbki, cechy)
-# print(f"y_target shape: {y_target.shape}")        # (próbki,)
+X_train, y_train, X_val, y_val, X_test, y_test, scaler, feature_columns, target_cols = prepare_train_val_test_data(data_with_indicators)
 
 
+print(X_train.shape,'X_train.shape')
+print(y_train.shape,'y_train.shape')
+print(X_val.shape,'X_val.shape')
+print(y_val.shape,'y_val.shape')
+print(X_test.shape,'X_test.shape')
 
 
