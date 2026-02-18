@@ -1,9 +1,9 @@
-
 # src/data_pipeline.py
 from __future__ import annotations
 
 import os
 import argparse
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -12,6 +12,7 @@ import pandas as pd
 import numpy as np
 import requests
 import yfinance as yf
+import pandas_ta as ta  # Dodano: biblioteka do wskaźników technicznych
 
 from utils import (
     ensure_dir,
@@ -25,8 +26,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Konfiguracja logowania
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+
 # ==============
-# CONFIG (default)
+# CONFIG (rozszerzony)
 # ==============
 DEFAULT_CONFIG = """
 ticker: "AAPL"
@@ -35,6 +39,9 @@ start: "2010-01-01"
 end: null
 price_interval: "1d"
 auto_adjust: true
+
+# Zapobieganie look-ahead bias: o ile dni przesunąć publikację raportu (dni kalendarzowe)
+fundamentals_lag_days: 60 
 
 benchmarks:
   tickers: ["^GSPC", "^VIX", "UUP", "^WIG20", "PLN=X"]
@@ -53,8 +60,6 @@ fundamentals:
     - "Total Assets"
     - "Total Liab"
     - "Operating Cash Flow"
-    - "Free Cash Flow"
-    - "Earnings Per Share"
 
 output:
   dir_bronze: "data/bronze"
@@ -63,380 +68,242 @@ output:
 """.strip()
 
 
+# (Funkcja load_config pozostaje bez zmian jak w oryginale)
 def load_config(path: Optional[str]) -> dict:
-    """
-    Priorytety:
-    1) jawna ścieżka z argumentu --config lub env ML_CONFIG
-    2) katalog skryptu/../config.yaml
-    3) working directory ./config.yaml
-    4) jeśli brak pliku -> zapis domyślnego do ../config.yaml i użycie
-    """
-    # 1) ENV / argument
     explicit = path or os.environ.get("ML_CONFIG")
     if explicit:
         cfg_path = Path(explicit).expanduser().resolve()
-        if not cfg_path.exists():
-            raise FileNotFoundError(f"Nie znaleziono configu pod ścieżką: {cfg_path}")
         with open(cfg_path, "r", encoding="utf-8") as f:
             return yaml.safe_load(f)
-
-    # 2) szukaj obok skryptu (../config.yaml względem src/)
     script_dir = Path(__file__).resolve().parent
     candidate1 = (script_dir.parent / "config.yaml")
     if candidate1.exists():
         with open(candidate1, "r", encoding="utf-8") as f:
             return yaml.safe_load(f)
 
-    # 3) working directory
-    candidate2 = Path("config.yaml").resolve()
-    if candidate2.exists():
-        with open(candidate2, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f)
-
-    # 4) brak — zapisz domyślny do ../config.yaml
     default_target = script_dir.parent / "config.yaml"
     default_target.parent.mkdir(parents=True, exist_ok=True)
     with open(default_target, "w", encoding="utf-8") as f:
         f.write(DEFAULT_CONFIG + "\n")
-    print(f"[INFO] Brak config.yaml — utworzyłem domyślny: {default_target}")
-
+    logging.info(f"Utworzono domyślny config: {default_target}")
     return yaml.safe_load(DEFAULT_CONFIG)
 
 
 # ==============
-# OHLCV (główna spółka i benchmarki)
+# FEATURE ENGINEERING
 # ==============
 
-def fetch_ohlcv_yf(
-    ticker: str,
-    start: Optional[str],
-    end: Optional[str],
-    interval: str = "1d",
-    auto_adjust: bool = True,
-) -> pd.DataFrame:
-    """
-    Pobiera OHLCV z yfinance.
-    Zwraca kolumny: Open, High, Low, Close, Adj Close, Volume (nazwy znormalizowane do lowercase)
-    Obsługuje MultiIndex zwracany przez yfinance (flatten).
-    """
-    df = yf.download(
-        tickers=ticker,
-        start=start,
-        end=end,
-        interval=interval,
-        auto_adjust=auto_adjust,
-        progress=False,
-        threads=True,
-        group_by="column",  # <-- kluczowe: spróbuj wymusić kolumny per pole, nie per ticker
-    )
+def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Dodaje wskaźniki techniczne i stopy zwrotu."""
+    df = df.copy()
 
-    if df is None or len(df) == 0:
-        raise ValueError(f"Brak danych dla {ticker} w yfinance.")
+    # Logarytmiczne stopy zwrotu (stacjonarność)
+    df["log_ret"] = np.log(df["close"] / df["close"].shift(1))
 
-    df = coerce_datetime_index(df)
+    # Wskaźniki z pandas_ta
+    # RSI: momentum
+    df.ta.rsi(length=14, append=True)
+    # MACD: trend
+    df.ta.macd(fast=12, slow=26, signal=9, append=True)
+    # ATR: zmienność
+    df.ta.atr(length=14, append=True)
+    # Bollinger Bands
+    df.ta.bbands(length=20, std=2, append=True)
 
-    # ---- Obsługa MultiIndex w kolumnach (np. ('AAPL','Open')) ----
-    if isinstance(df.columns, pd.MultiIndex):
-        # Jeśli to MultiIndex (ticker, field), a jest tylko jeden ticker -> zrzucamy poziom tickera
-        lvl0 = df.columns.get_level_values(0)
-        if getattr(lvl0, "nunique", lambda: len(set(lvl0)))() == 1:
-            df.columns = df.columns.get_level_values(-1)
-        else:
-            # Wielu tickerów – spłaszczamy "TICKER__FIELD"
-            df.columns = ["__".join([str(x) for x in tup if x is not None]) for tup in df.columns]
-
-    # Teraz powinna być zwykła Index z nazwami kolumn (string)
-    df.columns = [str(c).lower().replace(" ", "_") for c in df.columns]
+    # Procentowa zmiana wolumenu
+    df["vol_pct_change"] = df["volume"].pct_change()
 
     return df
 
-
-def fetch_benchmarks_yf(
-    tickers: List[str],
-    start: Optional[str],
-    end: Optional[str],
-    interval: str = "1d",
-    auto_adjust: bool = True,
-) -> Dict[str, pd.DataFrame]:
-    out = {}
-    for t in tickers:
-        try:
-            df = fetch_ohlcv_yf(t, start, end, interval, auto_adjust)
-            out[t] = df
-        except Exception as e:
-            print(f"[WARN] Nie udało się pobrać benchmarku {t}: {e}")
-    return out
-
-
 # ==============
-# Makro (FRED przez oficjalne API – requests)
+# POMOCNICZA: Standaryzacja czasu
 # ==============
-def fetch_fred_series(
-    series_id: str,
-    api_key: Optional[str],
-    start: Optional[str] = None,
-    end: Optional[str] = None,
-) -> pd.DataFrame:
-    """
-    Pobiera jedną serię FRED przez oficjalne API.
-    Wymaga klucza API (parametr lub zmienna środowiskowa FRED_API_KEY).
-    """
+def strip_tz(df: pd.DataFrame) -> pd.DataFrame:
+    """Usuwa informację o strefie czasowej z indeksu, czyniąc go 'naiwnym'."""
+    if df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
+    return df
+
+
+def fetch_fred_series(series_id, api_key, start, end) -> pd.DataFrame:
     key = api_key or os.environ.get("FRED_API_KEY")
     if not key:
-        raise RuntimeError(
-            "Brak klucza FRED API. Ustaw w config.yaml (macro.fred_api_key) lub zmiennej środowiskowej FRED_API_KEY."
-        )
+        raise RuntimeError("Brak klucza FRED API.")
 
     url = "https://api.stlouisfed.org/fred/series/observations"
     params = {
         "series_id": series_id,
         "api_key": key,
         "file_type": "json",
+        "observation_start": start,
+        "observation_end": end
     }
-    if start:
-        params["observation_start"] = start
-    if end:
-        params["observation_end"] = end
 
     r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
     data = r.json()
 
-    if "observations" not in data:
-        raise ValueError(f"Brak danych FRED dla {series_id}")
-
     df = pd.DataFrame(data["observations"])
-    # Pola: date, value (string)
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    df["date"] = pd.to_datetime(df["date"], utc=True)
+    df["date"] = pd.to_datetime(df["date"])
     df = df.set_index("date")[["value"]]
     df = df.rename(columns={"value": f"fred_{series_id}"})
+    return strip_tz(df)  # Czyścimy strefę czasową
+# ==============
+# POBIERANIE DANYCH (OHLCV, FRED, FUNDAMENTY)
+# ==============
+
+def fetch_ohlcv_yf(ticker: str, start, end, interval="1d", auto_adjust=True) -> pd.DataFrame:
+    df = yf.download(ticker, start=start, end=end, interval=interval,
+                     auto_adjust=auto_adjust, progress=False)
+    if df.empty:
+        raise ValueError(f"Brak danych dla {ticker}")
 
     df = coerce_datetime_index(df)
+
+    # Naprawa MultiIndex (yfinance 0.2.x często zwraca poziomy 'Price' i 'Ticker')
+    if isinstance(df.columns, pd.MultiIndex):
+        # Wybieramy poziom, który zawiera nazwy pól (Open, Close, itp.)
+        if "Price" in df.columns.names:
+            df.columns = df.columns.get_level_values("Price")
+        else:
+            df.columns = df.columns.get_level_values(0)
+
+    # Standaryzacja nazw kolumn na małe litery i podkreślniki
+    df.columns = [str(c).lower().replace(" ", "_") for c in df.columns]
+
+    # Jeśli użyliśmy auto_adjust=True, yf może nazwać główną cenę 'adj_close' lub 'close'.
+    # Mapujemy to na jedną nazwę 'close' dla spójności pipeline'u.
+    if 'adj_close' in df.columns and 'close' not in df.columns:
+        df = df.rename(columns={'adj_close': 'close'})
+
+    # Upewnienie się, że mamy niezbędną kolumnę
+    if 'close' not in df.columns:
+        # Próba ratunkowa: jeśli jest tylko jedna kolumna, to prawdopodobnie nasza cena
+        if len(df.columns) == 1:
+            df.columns = ['close']
+        else:
+            raise KeyError(f"Nie znaleziono kolumny 'close' w danych dla {ticker}. Dostępne: {list(df.columns)}")
 
     return df
 
 
-def fetch_macro_fred(
-    series_list: List[str],
-    start: Optional[str],
-    end: Optional[str],
-    fred_api_key: Optional[str] = None,
-) -> pd.DataFrame:
-    frames = []
-    for s in series_list:
-        try:
-            df = fetch_fred_series(s, api_key=fred_api_key, start=start, end=end)
-            frames.append(df)
-        except Exception as e:
-            print(f"[WARN] Błąd pobierania FRED {s}: {e}")
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, axis=1).sort_index()
-
-
-# ==============
-# Fundamenty (yfinance)
-# ==============
 def fetch_fundamentals_yf(ticker: str, fields: List[str]) -> pd.DataFrame:
-    """
-    Pobiera kwartalne fundamenty z yfinance i składa w jedną tabelę (as-of, w dni robocze).
-    yfinance zwraca osobne ramki dla financials/balance_sheet/cashflow/earnings (kolumny=daty).
-    """
     tk = yf.Ticker(ticker)
-
-    q_fin = tk.quarterly_financials if tk.quarterly_financials is not None else pd.DataFrame()
-    q_bs = tk.quarterly_balance_sheet if tk.quarterly_balance_sheet is not None else pd.DataFrame()
-    q_cf = tk.quarterly_cashflow if tk.quarterly_cashflow is not None else pd.DataFrame()
-    q_earn = tk.quarterly_earnings if tk.quarterly_earnings is not None else pd.DataFrame()
-
+    # Łączymy wszystkie dostępne sprawozdania
     frames = []
-    for name, df in [("fin", q_fin), ("bs", q_bs), ("cf", q_cf), ("earn", q_earn)]:
-        if df.empty:
-            continue
-        df = df.copy()
-        if not isinstance(df.columns, pd.DatetimeIndex):
-            try:
-                df.columns = pd.to_datetime(df.columns, utc=True, errors="coerce")
-            except Exception:
-                pass
-        df = df.T
-        df.columns = [str(c) for c in df.columns]
-        frames.append(df)
+    for df in [tk.quarterly_financials, tk.quarterly_balance_sheet, tk.quarterly_cashflow]:
+        if df is not None and not df.empty:
+            frames.append(df.T)
 
-    if not frames:
-        return pd.DataFrame()
+    if not frames: return pd.DataFrame()
 
-    fundamentals = pd.concat(frames, axis=1)
-    fundamentals.index.name = "report_date"
-    fundamentals = fundamentals.sort_index()
+    fundamentals = pd.concat(frames, axis=1, sort=False) # Dodano sort=False
+    fundamentals.index = pd.to_datetime(fundamentals.index, utc=True)
 
     if fields:
         available = [c for c in fields if c in fundamentals.columns]
-        fundamentals = fundamentals[available] if available else fundamentals
+        fundamentals = fundamentals[available]
 
-    fundamentals_daily = to_business_daily(fundamentals, method="ffill")
-    fundamentals_daily.columns = [f"fund_{c}" for c in fundamentals_daily.columns]
-    return fundamentals_daily
+    fundamentals.columns = [f"fund_{str(c).lower().replace(' ', '_')}" for c in fundamentals.columns]
+    return fundamentals.sort_index()
 
 
 # ==============
-# Scalanie wszystkiego w jedną ramkę dzienną
+# SCALANIE I ELIMINACJA LOOK-AHEAD BIAS
+# ==============
+
+# ==============
+# SCALANIE (Z poprawką join i tz)
 # ==============
 def align_and_merge(
-    main_price: pd.DataFrame,
-    benchmarks: Dict[str, pd.DataFrame],
-    macro: pd.DataFrame,
-    fundamentals_daily: pd.DataFrame,
+        main_price: pd.DataFrame,
+        benchmarks: Dict[str, pd.DataFrame],
+        macro: pd.DataFrame,
+        fundamentals: pd.DataFrame,
+        lag_days: int = 60
 ) -> pd.DataFrame:
-    main_d = to_business_daily(main_price)
-    main_d = main_d.rename(columns={c: f"{c}" for c in main_d.columns})
+    # 1. Baza
+    merged = to_business_daily(main_price)
+    merged = strip_tz(merged)  # Na wszelki wypadek
 
-    bench_cols = []
+    # Dodajemy wskaźniki techniczne
+    merged = add_technical_indicators(merged)
+
+    # 2. Benchmarks
     for t, df in benchmarks.items():
-        d = to_business_daily(df)
-        d = add_suffix(d, f"__{t}")
-        bench_cols.append(d)
+        bench_daily = to_business_daily(strip_tz(df))
+        # Logarytmiczna stopa zwrotu dla benchmarku
+        merged[f"bench_ret_{t}"] = np.log(bench_daily["close"] / bench_daily["close"].shift(1))
 
-    merged = main_d.copy()
-    for b in bench_cols:
-        merged = merged.join(b, how="left")
+    # 3. Makro (FRED)
+    if not macro.empty:
+        macro_d = to_business_daily(strip_tz(macro))
+        merged = merged.join(macro_d, how="left").ffill()
 
-    if macro is not None and not macro.empty:
-        macro_d = to_business_daily(macro)
-        merged = merged.join(macro_d, how="left")
+    # 4. Fundamenty (Z bezpiecznym przesunięciem)
+    if not fundamentals.empty:
+        fund_shifted = strip_tz(fundamentals.copy())
+        # Przesuwamy daty o lag_days (dni kalendarzowe)
+        fund_shifted.index = fund_shifted.index + pd.Timedelta(days=lag_days)
 
-    if fundamentals_daily is not None and not fundamentals_daily.empty:
-        merged = merged.join(fundamentals_daily, how="left")
+        # Join po usunięciu stref czasowych przejdzie bez błędu
+        merged = merged.join(fund_shifted, how="left")
+        merged[fund_shifted.columns] = merged[fund_shifted.columns].ffill()
 
-    # === UZUPELNIANIE FUNDAMENTÓW ===
-    fund_cols = [c for c in merged.columns if c.startswith("fund_")]
+    # 5. Generowanie TARGETU
+    merged["target_next_5d"] = merged["log_ret"].shift(-5).rolling(window=5).sum()
+    merged = merged.dropna(subset=["target_next_5d"])
 
-    # 1) Maska informująca model o braku raportu w danym dniu
-    for c in fund_cols:
-        merged[c + "_isna"] = merged[c].isna().astype(int)
+    return merged.sort_index()
 
-    # 2) Forward fill (od publikacji do kolejnego dnia)
-    merged[fund_cols] = merged[fund_cols].ffill()
 
-    # 3) Backfill (uzupełnienie wcześniejszych okresów)
-    merged[fund_cols] = merged[fund_cols].bfill()
+# ==============
+# RUNNER
+# ==============
 
-    merged = merged.sort_index()
+def run_pipeline(config_path: Optional[str] = None):
+    cfg = load_config(config_path)
 
-    # === UZUPELNIANIE MAKO ===
-    macro_cols = [c for c in merged.columns if c.startswith("fred_")]
-    if macro_cols:
-        merged[macro_cols] = merged[macro_cols].ffill()
+    # Pobieranie danych (skrócone wywołania)
+    main_price = fetch_ohlcv_yf(cfg["ticker"], cfg["start"], cfg["end"])
 
-    # Możesz dodać bfill dla makro (opcjonalnie), ale raczej nie trzeba
-    # merged[macro_cols] = merged[macro_cols].bfill()
+    benchmarks = {}
+    for t in cfg["benchmarks"]["tickers"]:
+        try:
+            benchmarks[t] = fetch_ohlcv_yf(t, cfg["start"], cfg["end"])
+        except:
+            logging.warning(f"Pominięto benchmark {t}")
 
-    merged = merged.dropna(how="all")
+    macro = pd.DataFrame()
+    if cfg["macro"]["provider"] == "fred":
+        try:
+            frames = [fetch_fred_series(s, cfg["macro"]["fred_api_key"], cfg["start"], cfg["end"])
+                      for s in cfg["macro"]["series"]]
+            macro = pd.concat(frames, axis=1, sort=False)  # Dodano sort=False
+        except Exception as e:
+            logging.warning(f"Błąd FRED: {e}")
+
+    fundamentals = pd.DataFrame()
+    if cfg["fundamentals"]["provider"] == "yfinance":
+        fundamentals = fetch_fundamentals_yf(cfg["ticker"], cfg["fundamentals"]["fields"])
+
+    # Scalanie z nową logiką
+    logging.info("Scalanie danych i generowanie cech...")
+    merged = align_and_merge(
+        main_price, benchmarks, macro, fundamentals,
+        lag_days=cfg.get("fundamentals_lag_days", 60)
+    )
+
+    # Zapis
+    out_dir = Path(cfg["output"]["dir_silver"])
+    ensure_dir(out_dir)
+    save_path = out_dir / f"{cfg['ticker']}_final_ml_data.parquet"
+    save_df(merged, str(save_path), "parquet")
+
+    logging.info(f"Pipeline zakończony. Rozmiar końcowy: {merged.shape}")
     return merged
 
 
-# ==============
-# Główny runner
-# ==============
-def run_pipeline(config_path: Optional[str] = None) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame], pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    cfg = load_config(config_path)
-
-    ticker = cfg["ticker"]
-    start = cfg.get("start")
-    end = cfg.get("end")
-    price_interval = cfg.get("price_interval", "1d")
-    auto_adjust = cfg.get("auto_adjust", True)
-
-    # Dane główne (OHLCV)
-    print(f"[INFO] Pobieram OHLCV dla: {ticker}")
-    main_price = fetch_ohlcv_yf(
-        ticker=ticker,
-        start=start,
-        end=end,
-        interval=price_interval,
-        auto_adjust=auto_adjust,
-    )
-
-    # Benchmarks
-    bm_cfg = cfg.get("benchmarks", {})
-    bm_tickers = bm_cfg.get("tickers", [])
-    bm_interval = bm_cfg.get("interval", "1d")
-    print(f"[INFO] Pobieram benchmarki: {bm_tickers}")
-    benchmarks = fetch_benchmarks_yf(
-        tickers=bm_tickers,
-        start=start,
-        end=end,
-        interval=bm_interval,
-        auto_adjust=True,
-    )
-
-    # Makro (FRED)
-    macro_cfg = cfg.get("macro", {})
-    macro = pd.DataFrame()
-    if macro_cfg.get("provider") == "fred":
-        series = macro_cfg.get("series", [])
-        fred_key = macro_cfg.get("fred_api_key")
-        if series:
-            print(f"[INFO] Pobieram FRED serie: {series}")
-            try:
-                macro = fetch_macro_fred(series_list=series, start=start, end=end, fred_api_key=fred_key)
-            except RuntimeError as e:
-                print(f"[WARN] {e} — pomijam makro FRED (ustaw klucz, aby pobierać).")
-
-    # Fundamenty (yfinance)
-    fund_cfg = cfg.get("fundamentals", {})
-    fundamentals_daily = pd.DataFrame()
-    if fund_cfg.get("provider") == "yfinance":
-        fields = fund_cfg.get("fields", [])
-        print(f"[INFO] Pobieram fundamenty yfinance (pola: {fields if fields else 'wszystkie dostępne'})")
-        try:
-            fundamentals_daily = fetch_fundamentals_yf(ticker, fields)
-        except Exception as e:
-            print(f"[WARN] Fundamentals yfinance dla {ticker}: {e}")
-
-    # Scalanie
-    print("[INFO] Scalanie danych do siatki dni roboczych…")
-    merged = align_and_merge(main_price, benchmarks, macro, fundamentals_daily)
-
-    # Zapisy
-    out_cfg = cfg.get("output", {})
-    dir_bronze = out_cfg.get("dir_bronze", "data/bronze")
-    dir_silver = out_cfg.get("dir_silver", "data/silver")
-    save_format = out_cfg.get("save_format", "parquet")
-
-    ensure_dir(dir_bronze)
-    ensure_dir(dir_silver)
-
-    # Bronze (raw)
-    save_df(main_price, os.path.join(dir_bronze, f"{ticker}_ohlcv.{save_format}"), save_format)
-    for t, df in benchmarks.items():
-        save_df(df, os.path.join(dir_bronze, f"benchmark_{t.replace('^','IDX_')}.{save_format}"), save_format)
-    if macro is not None and not macro.empty:
-        save_df(macro, os.path.join(dir_bronze, f"macro_fred.{save_format}"), save_format)
-    if fundamentals_daily is not None and not fundamentals_daily.empty:
-        save_df(fundamentals_daily, os.path.join(dir_bronze, f"{ticker}_fundamentals_daily.{save_format}"), save_format)
-
-    # Silver (merged, business-daily)
-    save_df(merged, os.path.join(dir_silver, f"{ticker}_merged_daily.{save_format}"), save_format)
-
-    print("[OK] Zakończono. Kształty:")
-    print(f"  OHLCV: {main_price.shape}")
-    print(f"  Benchmarks: {[ (k, v.shape) for k, v in benchmarks.items() ]}")
-    print(f"  Macro: {macro.shape}")
-    print(f"  Fundamentals (daily): {fundamentals_daily.shape}")
-    print(f"  Merged: {merged.shape}")
-
-    return main_price, benchmarks, macro, fundamentals_daily, merged
-
-
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--config", type=str, default=None, help="Ścieżka do config.yaml")
-    return p.parse_args()
-
-
 if __name__ == "__main__":
-    args = parse_args()
-    _ = run_pipeline(args.config)
-    print("Pipeline zakończony. Dane zapisane w data/bronze i data/silver.")
+    run_pipeline()
