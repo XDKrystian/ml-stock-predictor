@@ -1,0 +1,46 @@
+
+ticker: "AAPL"
+currency: "USD"
+
+start: "2010-01-01"
+end: null                # null = do dziś
+
+price_interval: "1d"
+auto_adjust: true
+
+benchmarks:
+  tickers:
+    - "^GSPC"            # S&P 500
+    - "^NDX"             # NASDAQ-100
+    - "^VIX"             # Volatility Index
+    - "UUP"              # ETF na indeks dolara (zawsze działa)
+  interval: "1d"
+
+macro:
+  provider: "fred"
+  series:
+    - "FEDFUNDS"         # stopy procentowe FED
+    - "CPIAUCSL"         # inflacja (CPI)
+    - "UNRATE"           # bezrobocie
+    - "DGS10"            # rentowność US 10y
+    - "M2SL"             # podaż pieniądza M2
+  fred_api_key: null     # ustaw KLUCZ, jeśli chcesz pobierać makro
+
+fundamentals:
+  provider: "yfinance"
+  fields:
+    - "Total Revenue"
+    - "Net Income"
+    - "Gross Profit"
+    - "Operating Income"
+    - "Total Assets"
+    - "Total Liab"
+    - "Cash And Cash Equivalents"
+    - "Operating Cash Flow"
+    - "Free Cash Flow"
+    - "Earnings Per Share"
+
+output:
+  dir_bronze: "data/bronze"
+  dir_silver: "data/silver"
+  save_format: "parquet"
