@@ -97,20 +97,19 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Dodaje wskaźniki techniczne i stopy zwrotu."""
     df = df.copy()
 
-    # Logarytmiczne stopy zwrotu (stacjonarność)
+    # 1. NAJPIERW obliczamy bazową stopę zwrotu
     df["log_ret"] = np.log(df["close"] / df["close"].shift(1))
 
-    # Wskaźniki z pandas_ta
-    # RSI: momentum
+    # 2. POTEM tworzymy opóźnienia (Lags)
+    for i in range(1, 4):
+        df[f'log_ret_lag_{i}'] = df['log_ret'].shift(i)
+
+    # 3. Dodajemy resztę wskaźników
     df.ta.rsi(length=14, append=True)
-    # MACD: trend
     df.ta.macd(fast=12, slow=26, signal=9, append=True)
-    # ATR: zmienność
     df.ta.atr(length=14, append=True)
-    # Bollinger Bands
     df.ta.bbands(length=20, std=2, append=True)
 
-    # Procentowa zmiana wolumenu
     df["vol_pct_change"] = df["volume"].pct_change()
 
     return df
@@ -210,11 +209,7 @@ def fetch_fundamentals_yf(ticker: str, fields: List[str]) -> pd.DataFrame:
 
 
 # ==============
-# SCALANIE I ELIMINACJA LOOK-AHEAD BIAS
-# ==============
-
-# ==============
-# SCALANIE (Z poprawką join i tz)
+# SCALANIE tymcasowe zostaje 180dni
 # ==============
 def align_and_merge(
         main_price: pd.DataFrame,
@@ -223,39 +218,101 @@ def align_and_merge(
         fundamentals: pd.DataFrame,
         lag_days: int = 60
 ) -> pd.DataFrame:
-    # 1. Baza
+    # 1. Baza i wskaźniki techniczne
     merged = to_business_daily(main_price)
-    merged = strip_tz(merged)  # Na wszelki wypadek
-
-    # Dodajemy wskaźniki techniczne
+    merged = strip_tz(merged)
     merged = add_technical_indicators(merged)
 
-    # 2. Benchmarks
+    # 2. Benchmarks (stopy zwrotu)
     for t, df in benchmarks.items():
         bench_daily = to_business_daily(strip_tz(df))
-        # Logarytmiczna stopa zwrotu dla benchmarku
         merged[f"bench_ret_{t}"] = np.log(bench_daily["close"] / bench_daily["close"].shift(1))
 
     # 3. Makro (FRED)
     if not macro.empty:
         macro_d = to_business_daily(strip_tz(macro))
-        merged = merged.join(macro_d, how="left").ffill()
+        merged = merged.join(macro_d, how="left")
 
-    # 4. Fundamenty (Z bezpiecznym przesunięciem)
+    # 4. Fundamenty (dołączamy, ale zaraz sprawdzimy ich jakość)
     if not fundamentals.empty:
         fund_shifted = strip_tz(fundamentals.copy())
-        # Przesuwamy daty o lag_days (dni kalendarzowe)
         fund_shifted.index = fund_shifted.index + pd.Timedelta(days=lag_days)
-
-        # Join po usunięciu stref czasowych przejdzie bez błędu
         merged = merged.join(fund_shifted, how="left")
-        merged[fund_shifted.columns] = merged[fund_shifted.columns].ffill()
 
-    # 5. Generowanie TARGETU
-    merged["target_next_5d"] = merged["log_ret"].shift(-5).rolling(window=5).sum()
-    merged = merged.dropna(subset=["target_next_5d"])
+    # --- CZYSZCZENIE DANYCH (OPCJA 1) ---
+
+    # A. Usuwamy kolumny, które mają więcej niż 50% NaN (np. puste fundamenty)
+    # To sprawi, że jeśli yfinance zawiedzie, pipeline i tak zadziała na reszcie danych.
+    threshold = len(merged) * 0.5
+    merged = merged.dropna(thresh=threshold, axis=1)
+
+    # B. Usuwamy kolumny o identycznej informacji (korelacja 1.0)
+    # Wybieramy tylko kolumny numeryczne do obliczenia korelacji
+    numeric_cols = merged.select_dtypes(include=[np.number]).columns
+    if len(numeric_cols) > 1:
+        corr_matrix = merged[numeric_cols].corr().abs()
+        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+        to_drop = [column for column in upper.columns if any(upper[column] >= 0.999)]
+        if to_drop:
+            logging.info(f"Usuwam zduplikowane cechy: {to_drop}")
+            merged = merged.drop(columns=to_drop)
+
+    # 5. Generowanie TARGETU (Klasyfikacja: 1 jeśli wzrost, 0 jeśli spadek/brak zmian)
+    # Przewidujemy kierunek sumarycznego ruchu z następnych 5 dni
+    future_return = merged["log_ret"].shift(-5).rolling(window=5).sum()
+    merged["target_bin"] = (future_return > 0).astype(int)
+
+    # Usuwamy wiersze z NaN (początkowe lagi i końcowe targety)
+    merged = merged.ffill().dropna()
+
+    # D. Finalne wypełnianie i usuwanie resztek NaN
+    # ffill() uzupełnia luki w makro, dropna() usuwa początkowe i końcowe braki
+    merged = merged.ffill().dropna()
 
     return merged.sort_index()
+# ==============
+# SCALANIE (Z poprawką join i tz)
+# ==============
+# def align_and_merge(
+#         main_price: pd.DataFrame,
+#         benchmarks: Dict[str, pd.DataFrame],
+#         macro: pd.DataFrame,
+#         fundamentals: pd.DataFrame,
+#         lag_days: int = 60
+# ) -> pd.DataFrame:
+#     # 1. Baza
+#     merged = to_business_daily(main_price)
+#     merged = strip_tz(merged)  # Na wszelki wypadek
+#
+#     # Dodajemy wskaźniki techniczne
+#     merged = add_technical_indicators(merged)
+#
+#     # 2. Benchmarks
+#     for t, df in benchmarks.items():
+#         bench_daily = to_business_daily(strip_tz(df))
+#         # Logarytmiczna stopa zwrotu dla benchmarku
+#         merged[f"bench_ret_{t}"] = np.log(bench_daily["close"] / bench_daily["close"].shift(1))
+#
+#     # 3. Makro (FRED)
+#     if not macro.empty:
+#         macro_d = to_business_daily(strip_tz(macro))
+#         merged = merged.join(macro_d, how="left").ffill()
+#
+#     # 4. Fundamenty (Z bezpiecznym przesunięciem)
+#     if not fundamentals.empty:
+#         fund_shifted = strip_tz(fundamentals.copy())
+#         # Przesuwamy daty o lag_days (dni kalendarzowe)
+#         fund_shifted.index = fund_shifted.index + pd.Timedelta(days=lag_days)
+#
+#         # Join po usunięciu stref czasowych przejdzie bez błędu
+#         merged = merged.join(fund_shifted, how="left")
+#         merged[fund_shifted.columns] = merged[fund_shifted.columns].ffill()
+#
+#     # 5. Generowanie TARGETU
+#     merged["target_next_5d"] = merged["log_ret"].shift(-5).rolling(window=5).sum()
+#     merged = merged.dropna(subset=["target_next_5d"])
+#
+#     return merged.sort_index()
 
 
 # ==============
